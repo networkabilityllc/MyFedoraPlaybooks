@@ -1,21 +1,54 @@
+
 ---
 - name: Execute Initial Fedora Setup Commands
   hosts: localhost
+  connection: local
   become: true
   gather_facts: true
 
   vars:
-    fastfetch_arch_map:
-      x86_64: amd64
-      aarch64: aarch64
+    minimum_user_uid: 1000
+    maximum_user_uid: 65533
+
+    system_packages:
+      - 7zip
+      - bat
+      - cowsay
+      - duf
+      - fastfetch
+      - fd-find
+      - fortune-mod
+      - fzf
+      - gcc
+      - gcc-c++
+      - glibc-langpack-en
+      - iftop
+      - make
+      - micro
+      - net-tools
+      - pam
+      - python3
+      - python3-docker
+      - python3-pip
+      - rpm-build
+      - screen
+      - unzip
+      - zellij
 
   tasks:
-    - name: Check if cloud-init is present on the system
+    - name: Verify that the target is Fedora
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Fedora"
+        fail_msg: "This playbook supports Fedora only."
+        success_msg: "Fedora detected."
+
+    - name: Check if cloud-init is present
       ansible.builtin.stat:
         path: /etc/cloud
       register: cloud_init_dir
 
-    - name: Ensure necessary directories exist
+    - name: Ensure system configuration directories exist
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
@@ -30,6 +63,8 @@
       ansible.builtin.blockinfile:
         path: /etc/systemd/system/getty@tty1.service.d/cloud-init_wait.conf
         create: true
+        owner: root
+        group: root
         mode: '0644'
         marker: "# {mark} ANSIBLE MANAGED BLOCK - cloud-init wait"
         block: |
@@ -39,29 +74,7 @@
 
     - name: Install system package dependencies
       ansible.builtin.dnf:
-        name:
-          - 7zip
-          - bat
-          - cowsay
-          - duf
-          - fd-find
-          - fortune-mod
-          - fzf
-          - gcc
-          - gcc-c++
-          - glibc-langpack-en
-          - iftop
-          - make
-          - micro
-          - net-tools
-          - pam
-          - python3
-          - python3-docker
-          - python3-pip
-          - rpm-build
-          - unzip
-          - screen
-          - zellij
+        name: "{{ system_packages }}"
         state: present
         update_cache: true
 
@@ -76,64 +89,6 @@
         group: root
         mode: '0644'
 
-    - name: Check if fastfetch is available in repositories
-      ansible.builtin.command: dnf info --available fastfetch
-      register: fastfetch_check
-      failed_when: false
-      changed_when: false
-
-    - name: Try installing fastfetch from Fedora repositories
-      ansible.builtin.dnf:
-        name: fastfetch
-        state: present
-        update_cache: true
-      when: fastfetch_check.rc == 0
-      register: fastfetch_repo_install
-      ignore_errors: true
-
-    - name: Install fastfetch from GitHub release when no repository package is available
-      when: fastfetch_check.rc != 0 or (fastfetch_repo_install is defined and fastfetch_repo_install is failed)
-      block:
-        - name: Determine architecture mapping
-          ansible.builtin.set_fact:
-            fastfetch_arch: "{{ fastfetch_arch_map[ansible_architecture] | default('') }}"
-
-        - name: Validate supported architecture
-          ansible.builtin.fail:
-            msg: "Unsupported architecture for fastfetch release: {{ ansible_architecture }}"
-          when: fastfetch_arch == ''
-
-        - name: Fetch latest fastfetch release metadata
-          ansible.builtin.uri:
-            url: https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest
-            return_content: true
-            headers:
-              Accept: application/vnd.github+json
-              User-Agent: ansible-provisioning
-            status_code: 200
-          register: fastfetch_release
-          until: fastfetch_release.status == 200
-          retries: 3
-          delay: 5
-
-        - name: Select the matching fastfetch RPM download URL
-          ansible.builtin.set_fact:
-            fastfetch_rpm_url: >-
-              {{ fastfetch_release.json.assets
-                 | selectattr('name', 'contains', fastfetch_arch + '.rpm')
-                 | map(attribute='browser_download_url')
-                 | first | default('') }}
-
-        - name: Validate fastfetch release asset
-          ansible.builtin.fail:
-            msg: "No fastfetch RPM release asset found for architecture {{ fastfetch_arch }}"
-          when: fastfetch_rpm_url == ''
-
-        - name: Install fastfetch RPM directly from GitHub
-          ansible.builtin.dnf:
-            name: "{{ fastfetch_rpm_url }}"
-            state: present
-
     - name: Configure journald retention limits
       ansible.builtin.copy:
         dest: /etc/systemd/journald.conf.d/99-limits.conf
@@ -145,11 +100,14 @@
           SystemMaxUse=200M
           SystemKeepFree=500M
           MaxRetentionSec=14day
+      notify: Restart systemd-journald
 
     - name: Configure system-wide screenrc
       ansible.builtin.blockinfile:
         path: /etc/screenrc
         create: true
+        owner: root
+        group: root
         mode: '0644'
         marker: "# {mark} ANSIBLE MANAGED BLOCK - screenrc"
         block: |
@@ -161,24 +119,99 @@
           bindkey -k up send-up
           bindkey -k dn send-down
 
-    - name: Get list of interactive user homes
-      ansible.builtin.find:
-        paths: /home
-        file_type: directory
-        recurse: false
-      register: user_dirs
+    - name: Read local user accounts
+      ansible.builtin.getent:
+        database: passwd
 
-    - name: Set existing user and root home directory list
+    - name: Initialize interactive user list
       ansible.builtin.set_fact:
-        target_homes: "{{ user_dirs.files | map(attribute='path') | list + ['/root'] }}"
+        interactive_users: []
 
-    - name: Set shell configuration home directory list
+    - name: Build list of interactive users
       ansible.builtin.set_fact:
-        shell_config_homes: "{{ target_homes + ['/etc/skel'] }}"
+        interactive_users: >-
+          {{
+            interactive_users + [
+              {
+                'name': item.key,
+                'home': item.value[4],
+                'gid': item.value[2]
+              }
+            ]
+          }}
+      loop: "{{ getent_passwd | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - item.value[1] | int >= minimum_user_uid
+        - item.value[1] | int <= maximum_user_uid
+        - item.value[4] is match('^/home/[^/]+$')
+        - item.value[5] not in ['/sbin/nologin', '/usr/sbin/nologin', '/bin/false']
 
-    - name: Deploy .inputrc to existing users, root, and skel
+    - name: Add root to target home directory list
+      ansible.builtin.set_fact:
+        target_homes: >-
+          {{
+            interactive_users + [
+              {
+                'name': 'root',
+                'home': '/root',
+                'gid': '0'
+              }
+            ]
+          }}
+
+    - name: Include skeleton directory for shell configuration
+      ansible.builtin.set_fact:
+        shell_config_homes: >-
+          {{
+            target_homes + [
+              {
+                'name': 'root',
+                'home': '/etc/skel',
+                'gid': '0'
+              }
+            ]
+          }}
+
+    - name: Check target home directories
+      ansible.builtin.stat:
+        path: "{{ item.home }}"
+      loop: "{{ target_homes }}"
+      loop_control:
+        label: "{{ item.home }}"
+      register: target_home_stats
+
+    - name: Keep only existing home directories
+      ansible.builtin.set_fact:
+        target_homes: >-
+          {{
+            target_home_stats.results
+            | selectattr('stat.isdir', 'defined')
+            | selectattr('stat.isdir', 'equalto', true)
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Rebuild shell configuration home list
+      ansible.builtin.set_fact:
+        shell_config_homes: >-
+          {{
+            target_homes + [
+              {
+                'name': 'root',
+                'home': '/etc/skel',
+                'gid': '0'
+              }
+            ]
+          }}
+
+    - name: Deploy inputrc to users, root, and skel
       ansible.builtin.copy:
-        dest: "{{ item }}/.inputrc"
+        dest: "{{ item.home }}/.inputrc"
+        owner: "{{ item.name }}"
+        group: "{{ item.gid }}"
+        mode: '0644'
         content: |
           set completion-ignore-case on
           set show-all-if-ambiguous on
@@ -200,33 +233,39 @@
           "\e[F": end-of-line
           "\e[3~": delete-char
           set match-hidden-files on
-        owner: "{{ 'root' if item in ['/root', '/etc/skel'] else (item | basename) }}"
-        group: "{{ 'root' if item in ['/root', '/etc/skel'] else (item | basename) }}"
-        mode: '0644'
       loop: "{{ shell_config_homes }}"
+      loop_control:
+        label: "{{ item.home }}"
 
-    - name: Ensure .local/share directory exists for existing users and root
+    - name: Ensure local share directories exist
       ansible.builtin.file:
-        path: "{{ item }}/.local/share"
+        path: "{{ item.home }}/.local/share"
         state: directory
-        owner: "{{ 'root' if item == '/root' else (item | basename) }}"
-        group: "{{ 'root' if item == '/root' else (item | basename) }}"
+        owner: "{{ item.name }}"
+        group: "{{ item.gid }}"
         mode: '0755'
       loop: "{{ target_homes }}"
+      loop_control:
+        label: "{{ item.home }}"
 
-    - name: Configure .bashrc additions for existing users, root, and skel
+    - name: Configure bashrc additions for users, root, and skel
       ansible.builtin.blockinfile:
-        path: "{{ item }}/.bashrc"
+        path: "{{ item.home }}/.bashrc"
         create: true
-        owner: "{{ 'root' if item in ['/root', '/etc/skel'] else (item | basename) }}"
-        group: "{{ 'root' if item in ['/root', '/etc/skel'] else (item | basename) }}"
+        owner: "{{ item.name }}"
+        group: "{{ item.gid }}"
         mode: '0644'
         marker: "# {mark} ANSIBLE MANAGED BLOCK - MOTD + fzf helper"
         block: |
           if [[ $- == *i* ]]; then
-              clear
-              fastfetch --logo none
-              echo
+              if [[ "${_FASTFETCH_SHOWN:-0}" != "1" ]]; then
+                  if command -v fastfetch >/dev/null 2>&1; then
+                      clear
+                      fastfetch --logo none
+                      echo
+                  fi
+                  _FASTFETCH_SHOWN=1
+              fi
           fi
 
           alias dfl='duf --only local'
@@ -275,15 +314,24 @@
               clr
           }
       loop: "{{ shell_config_homes }}"
+      loop_control:
+        label: "{{ item.home }}"
 
-    - name: Disable cloud-init on full Virtual Machines
+    - name: Disable cloud-init on non-guest systems
       ansible.builtin.file:
         path: /etc/cloud/cloud-init.disabled
         state: touch
+        access_time: preserve
+        modification_time: preserve
         owner: root
         group: root
         mode: '0644'
       when:
         - cloud_init_dir.stat.exists
-        - ansible_virtualization_type not in ["docker", "container", "lxc", "podman", "openvz", "systemd-nspawn"]
-        - ansible_virtualization_role != "guest" or ansible_virtualization_type == "kvm"
+        - ansible_virtualization_role != "guest"
+
+  handlers:
+    - name: Restart systemd-journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
