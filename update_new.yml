@@ -33,7 +33,6 @@
       - rpm-build
       - screen
       - unzip
-      - zellij
 
   tasks:
     - name: Verify that the target is Fedora
