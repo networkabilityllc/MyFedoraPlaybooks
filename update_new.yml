@@ -242,7 +242,7 @@
         state: directory
         owner: "{{ item.name }}"
         group: "{{ item.gid }}"
-        mode: '0755'
+        mode: '0700'
       loop: "{{ target_homes }}"
       loop_control:
         label: "{{ item.home }}"
